@@ -78,9 +78,4 @@ Configure detection thresholds, FSM parameters, and system preferences.
 
 ---
 
-## Installation & Usage
 
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/X-Trace-IDS.git
-cd X-Trace-IDS

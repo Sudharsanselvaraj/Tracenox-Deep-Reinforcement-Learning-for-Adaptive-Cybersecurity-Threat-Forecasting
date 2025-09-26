@@ -1,0 +1,239 @@
+!pip install kagglehubimport kagglehub
+
+path = kagglehub.dataset_download("dhoogla/cicids2017")
+print("Path to dataset files:", path)
+
+!pip install -q pandas pyarrow scikit-learn imbalanced-learn tensorflow==2.* numpy joblib
+
+import os, glob, gc, time
+import numpy as np
+import pandas as pd
+from collections import Counter
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+import joblib
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks, backend as K
+from imblearn.over_sampling import SMOTE
+
+RANDOM_STATE = 42
+BATCH_SIZE = 2048
+EPOCHS = 25
+OVERSAMPLE_WITH_SMOTE = False
+USE_FOCAL_LOSS = False
+OVERRIDE_MARGIN = 0.70
+CAP_PER_CLASS = None
+VERBOSE = 1
+
+try:
+    path
+except NameError:
+    raise AssertionError("Variable 'path' not set. Run kagglehub.dataset_download(...) or set 'path' manually.")
+
+parquet_files = glob.glob(os.path.join(path, "*.parquet"))
+if not parquet_files:
+    raise FileNotFoundError(f"No parquet files found in path={path}")
+
+df_list = [pd.read_parquet(f) for f in parquet_files]
+df = pd.concat(df_list, ignore_index=True)
+del df_list; gc.collect()
+
+df = df.replace([np.inf, -np.inf], np.nan).dropna()
+nunique = df.nunique()
+const_cols = nunique[nunique <= 1].index.tolist()
+if const_cols:
+    df.drop(columns=const_cols, inplace=True)
+if 'Label' not in df.columns:
+    raise AssertionError("'Label' column not found in dataset.")
+
+y_text = df['Label'].astype(str).values
+X_df = df.drop(columns=['Label']).reset_index(drop=True)
+feature_names = X_df.columns.tolist()
+X_raw = X_df.copy()
+le = LabelEncoder()
+y = le.fit_transform(y_text)
+classes = le.classes_
+n_classes = len(classes)
+
+if CAP_PER_CLASS is not None:
+    keep_idx = []
+    counts = Counter()
+    for i, yi in enumerate(y):
+        if counts[yi] < CAP_PER_CLASS:
+            keep_idx.append(i)
+            counts[yi] += 1
+    X_df = X_df.iloc[keep_idx].reset_index(drop=True)
+    X_raw = X_raw.iloc[keep_idx].reset_index(drop=True)
+    y = y[keep_idx]
+
+X_train_df, X_temp_df, y_train, y_temp = train_test_split(
+    X_df, y, test_size=0.30, random_state=RANDOM_STATE, stratify=y
+)
+X_val_df, X_test_df, y_val, y_test = train_test_split(
+    X_temp_df, y_temp, test_size=0.50, random_state=RANDOM_STATE, stratify=y_temp
+)
+X_raw_train = X_raw.loc[X_train_df.index].reset_index(drop=True)
+X_raw_val   = X_raw.loc[X_val_df.index].reset_index(drop=True)
+X_raw_test  = X_raw.loc[X_test_df.index].reset_index(drop=True)
+
+if OVERSAMPLE_WITH_SMOTE:
+    sm = SMOTE(random_state=RANDOM_STATE, n_jobs=-1)
+    X_train_res, y_train_res = sm.fit_resample(X_train_df, y_train)
+    X_train_df = pd.DataFrame(X_train_res, columns=feature_names)
+    y_train = y_train_res
+
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train_df.astype('float32'))
+X_val   = scaler.transform(X_val_df.astype('float32'))
+X_test  = scaler.transform(X_test_df.astype('float32'))
+
+def to_seq(arr):
+    return np.expand_dims(arr, axis=-1)
+
+X_train_seq = to_seq(X_train)
+X_val_seq   = to_seq(X_val)
+X_test_seq  = to_seq(X_test)
+input_len = X_train_seq.shape[1]
+
+class_weights_arr = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
+class_weight_dict = {i: float(w) for i, w in enumerate(class_weights_arr)}
+
+tf.keras.backend.clear_session()
+def focal_loss(alpha=0.25, gamma=2.0):
+    def loss(y_true, y_pred):
+        y_true_ = tf.cast(y_true, tf.int32)
+        y_true_onehot = tf.one_hot(y_true_, depth=n_classes)
+        y_pred = tf.clip_by_value(y_pred, K.epsilon(), 1.0 - K.epsilon())
+        cross_entropy = - y_true_onehot * tf.math.log(y_pred)
+        weight = alpha * tf.math.pow(1 - y_pred, gamma)
+        fl = weight * cross_entropy
+        return tf.reduce_sum(fl, axis=-1)
+    return loss
+
+inputs = layers.Input(shape=(input_len, 1))
+x = layers.Conv1D(64, kernel_size=5, padding='same', activation='relu')(inputs)
+x = layers.BatchNormalization()(x)
+x = layers.MaxPooling1D(pool_size=2)(x)
+x = layers.Conv1D(128, kernel_size=3, padding='same', activation='relu')(x)
+x = layers.BatchNormalization()(x)
+x = layers.MaxPooling1D(pool_size=2)(x)
+x = layers.Bidirectional(layers.LSTM(64, return_sequences=False))(x)
+x = layers.Dropout(0.3)(x)
+x = layers.Dense(128, activation='relu')(x)
+x = layers.Dropout(0.2)(x)
+outputs = layers.Dense(n_classes, activation='softmax')(x)
+
+model = models.Model(inputs, outputs)
+loss_fn = focal_loss() if USE_FOCAL_LOSS else 'sparse_categorical_crossentropy'
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss=loss_fn, metrics=['accuracy'])
+
+train_ds = tf.data.Dataset.from_tensor_slices((X_train_seq, y_train)).shuffle(10000).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+val_ds   = tf.data.Dataset.from_tensor_slices((X_val_seq, y_val)).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+callbacks_list = [
+    callbacks.EarlyStopping(patience=5, restore_best_weights=True, monitor='val_accuracy'),
+    callbacks.ReduceLROnPlateau(patience=3, factor=0.5, monitor='val_loss')
+]
+
+start_time = time.time()
+history = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, class_weight=class_weight_dict, callbacks=callbacks_list, verbose=VERBOSE)
+print("Training time (s):", time.time() - start_time)
+
+test_ds = tf.data.Dataset.from_tensor_slices((X_test_seq, y_test)).batch(BATCH_SIZE)
+proba_dl = model.predict(test_ds, verbose=VERBOSE)
+pred_dl = np.argmax(proba_dl, axis=1)
+
+print(classification_report(y_test, pred_dl, target_names=classes, digits=4))
+print("Confusion matrix shape:", confusion_matrix(y_test, pred_dl).shape)
+
+feature_to_idx_raw = {name: i for i, name in enumerate(feature_names)}
+def get_raw_val(row_raw_array, name, default=0.0):
+    idx = feature_to_idx_raw.get(name)
+    if idx is None: return default
+    return float(row_raw_array[idx])
+
+name_to_idx = {name: idx for idx, name in enumerate(classes)}
+def fsm_rule_vote_raw(row_raw):
+    fps = get_raw_val(row_raw, 'Flow Packets/s', 0.0)
+    bps = get_raw_val(row_raw, 'Bwd Packets/s', 0.0)
+    syn = get_raw_val(row_raw, 'SYN Flag Count', 0.0)
+    ack = get_raw_val(row_raw, 'ACK Flag Count', 0.0)
+    psh = get_raw_val(row_raw, 'PSH Flag Count', 0.0)
+    rst = get_raw_val(row_raw, 'RST Flag Count', 0.0)
+    fin = get_raw_val(row_raw, 'FIN Flag Count', 0.0)
+    avg_pkt = get_raw_val(row_raw, 'Avg Packet Size', 0.0)
+    down_up = get_raw_val(row_raw, 'Down/Up Ratio', 0.0)
+    fwd_pkts = get_raw_val(row_raw, 'Total Fwd Packets', 0.0)
+    bwd_pkts = get_raw_val(row_raw, 'Total Backward Packets', 0.0)
+    if syn >= 1 and ack == 0 and fps > 200 and avg_pkt < 200:
+        for k in ['PortScan', 'Portscan', 'Port Scan']:
+            if k in name_to_idx: return name_to_idx[k]
+    if fps > 800 or (fps > 400 and bps > 100):
+        if 'DDoS' in name_to_idx: return name_to_idx['DDoS']
+    if fps > 300 and bwd_pkts < 5 and ack == 0:
+        for k in ['DoS Hulk', 'DoS GoldenEye', 'DoS Slowhttptest', 'DoS slowloris']:
+            if k in name_to_idx: return name_to_idx[k]
+    if 0.1 < fps < 50 and syn == 0 and ack >= 1 and (down_up > 10 or down_up < 0.1):
+        if 'Bot' in name_to_idx: return name_to_idx['Bot']
+    if syn >= 1 and 20 < fps < 300 and ack == 0:
+        for k in ['FTP-Patator', 'SSH-Patator', 'FTP Patator', 'SSH Patator']:
+            if k in name_to_idx: return name_to_idx[k]
+    if psh >= 1 and ack >= 1 and 1 < fps < 200 and avg_pkt > 250:
+        for k in ['Web Attack � Brute Force', 'Web Attack � Sql Injection', 'Web Attack � XSS', 'WebAttacks', 'Web Attack']:
+            if k in name_to_idx: return name_to_idx[k]
+    return None
+
+def apply_fsm_on_df(X_df_raw):
+    arr = X_df_raw.values.astype(float)
+    out = np.full((arr.shape[0],), -1, dtype=int)
+    for i in range(arr.shape[0]):
+        vote = fsm_rule_vote_raw(arr[i])
+        if vote is not None: out[i] = vote
+    return out
+
+fsm_val = apply_fsm_on_df(X_val_df)
+fsm_test = apply_fsm_on_df(X_test_df)
+
+def hybrid_from(proba_array, fsm_idx_array, margin=OVERRIDE_MARGIN):
+    pred = np.argmax(proba_array, axis=1)
+    conf = np.max(proba_array, axis=1)
+    hybrid = pred.copy()
+    for i in range(len(pred)):
+        if fsm_idx_array[i] != -1 and conf[i] < margin:
+            hybrid[i] = fsm_idx_array[i]
+    return hybrid
+
+val_ds = tf.data.Dataset.from_tensor_slices((X_val_seq, y_val)).batch(BATCH_SIZE)
+proba_val = model.predict(val_ds, verbose=VERBOSE)
+pred_val = np.argmax(proba_val, axis=1)
+hyb_val = hybrid_from(proba_val, fsm_val, margin=OVERRIDE_MARGIN)
+
+hyb_test = hybrid_from(proba_dl, fsm_test, margin=OVERRIDE_MARGIN)
+
+os.makedirs("xtrace_artifacts", exist_ok=True)
+model.save("xtrace_artifacts/cicids_cnn_bilstm.h5")
+joblib.dump(scaler, "xtrace_artifacts/scaler.pkl")
+joblib.dump(le, "xtrace_artifacts/label_encoder.pkl")
+with open("xtrace_artifacts/feature_names.txt", "w") as f:
+    f.write("\n".join(feature_names))
+
+def predict_single_flow(flow_dict, override_margin=OVERRIDE_MARGIN):
+    vec = np.array([flow_dict.get(fn, 0.0) for fn in feature_names], dtype=float).reshape(1, -1)
+    vec_scaled = scaler.transform(vec)
+    vec_seq = np.expand_dims(vec_scaled, axis=-1)
+    proba = model.predict(vec_seq)[0]
+    deep_idx = int(np.argmax(proba)); deep_conf = float(np.max(proba))
+    deep_label = le.inverse_transform([deep_idx])[0]
+    raw_vec = np.array([flow_dict.get(fn, 0.0) for fn in feature_names], dtype=float)
+    fsm_idx = fsm_rule_vote_raw(raw_vec)
+    fsm_label = le.inverse_transform([fsm_idx])[0] if (fsm_idx is not None and fsm_idx != -1) else None
+    final_idx = deep_idx
+    if fsm_idx is not None and deep_conf < override_margin:
+        final_idx = fsm_idx
+    final_label = le.inverse_transform([final_idx])[0]
+    return {'deep_pred': deep_label, 'deep_conf': deep_conf, 'fsm_vote': fsm_label, 'final': final_label}
+
+example_flow = X_test_df.iloc[0].to_dict()
+print(predict_single_flow(example_flow))

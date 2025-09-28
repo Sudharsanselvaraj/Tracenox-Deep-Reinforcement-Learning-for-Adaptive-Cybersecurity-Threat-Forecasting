@@ -1,6 +1,6 @@
 # Tracenox: Towards Adaptive Cybersecurity using Hybrid Deep Learning and FSM Models
 
-Tracenox is a real-time, AI-powered Intrusion Detection System (IDS) designed for monitoring, analyzing, and defending network traffic. It integrates deep learning and rule-based heuristics (FSM) for hybrid threat detection, offering high accuracy and adaptive response to evolving network attacks.
+Tracenox is a real-time, AI-powered Intrusion Detection System (IDS) designed for monitoring, analyzing, and defending network traffic. It integrates deep learning and rule-based heuristics (FSM) for hybrid threat detection, offering high accuracy and adaptive response to evolving network attacks.Using Deeplearning and FSM
 
 ---
 
